@@ -1,146 +1,82 @@
-# Pitch oral - Personne 4 (Terraform GCP + démonstration finale)
+Personne 4 — Redis + DB + Infrastructure GKE
+Rôle dans l'architecture
+Redis (stockage temporaire des votes) et PostgreSQL (stockage permanent des résultats) forment la couche données. Cette personne gère aussi toute l'infrastructure GKE et Terraform GCP.
 
-## Mon role (Personne 4)
-Je présente la partie Infrastructure as Code sur GCP avec Terraform, puis je fais la validation finale de l'application en conditions d'examen.
+Docker
+docker-compose.yaml — pas de Dockerfile, images directes :
 
-Mes objectifs oraux:
-- Montrer que l'infra est reproductible (cluster GKE + manifests Kubernetes)
-- Montrer la valeur de la Part 3 (Redis externalise sur VM)
-- Montrer une verification factuelle avec commandes et outputs
+redis:alpine sur back-net, volume bind pour les healthchecks
+postgres:15-alpine sur back-net, volume db-data pour la persistance
+Variables d'environnement : POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
+Healthchecks via scripts shell (healthchecks/redis.sh, healthchecks/postgres.sh)
+Healthchecks :
 
----
+redis.sh : exécute redis-cli ping, vérifie que la réponse est PONG
+postgres.sh : exécute SELECT 1 via psql, vérifie que le résultat est 1
+Kubernetes
+redis-deployment.yaml (k8s/redis-deployment.yaml) :
 
-## Commande de contexte cluster (a dire + executer)
-Avant toute verification Kubernetes, je recupere le contexte du cluster:
+InitContainer busybox:1.36 qui écrit le script redis.sh dans un volume emptyDir
+Container principal redis:alpine avec livenessProbe exec sur le script
+Astuce : pas besoin de créer une image custom pour Redis, l'initContainer injecte le healthcheck
+redis-service.yaml (k8s/redis-service.yaml) :
 
-```bash
-gcloud container clusters get-credentials projet-nuage-tf --zone europe-west3-a --project lab-gcp-kube
-```
+Type ClusterIP — Redis n'est JAMAIS exposé à l'extérieur
+Port 6379, accessible uniquement par vote et worker via le DNS interne redis
+db-deployment.yaml (k8s/db-deployment.yaml) :
 
-Phrase a dire:
-"Je connecte mon client kubectl au cluster cree par Terraform pour verifier l'etat reel des ressources." 
+Même pattern initContainer pour le healthcheck postgres
+envFrom: configMapRef: app-config pour les credentials
+Volume PVC monté sur /var/lib/postgresql/data avec subPath: data
+db-pvc.yaml (k8s/db-pvc.yaml) :
 
----
+PersistentVolumeClaim de 1Gi, ReadWriteOnce
+Garantit que les données survivent au redémarrage/suppression du pod
+db-service.yaml (k8s/db-service.yaml) :
 
-## Script oral pret a dire (3 a 5 minutes)
+Type ClusterIP — PostgreSQL n'est JAMAIS exposé à l'extérieur
+Port 5432, accessible par result et worker via le DNS interne db
+app-configmap.yaml (k8s/app-configmap.yaml) :
 
-### 1) Introduction (20-30s)
-"Je suis la personne 4. Je couvre la partie Terraform GCP: creation du cluster, deploiement des manifests Kubernetes, puis extension Part 3 avec Redis sur VM. L'objectif est de montrer une architecture reproductible et verifiable par commandes."
+ConfigMap centralisée avec toutes les variables : options de vote, credentials DB, hosts
+Utilisée par tous les services via envFrom
+Kustomize (k8s/kustomize/kustomization.yaml) :
 
-### 2) Methode Terraform (30-40s)
-"On a separe le projet en deux couches Terraform: une couche locale Docker pour la partie 1, puis une couche GCP/Kubernetes pour les parties 2 et 3. La couche GCP utilise le provider Google pour le cluster et le provider Kubernetes pour appliquer les manifests via `kubernetes_manifest`."
+Référence tous les manifests + configMapGenerator pour générer le ConfigMap
+Alternative au manifest manuel, génère un suffixe de hash pour forcer le redéploiement si les valeurs changent
+Terraform Docker (terraform/modules/redis/ et terraform/modules/postgres/)
+Redis : image redis:alpine, healthcheck, réseau back-net, bind mount healthchecks
+Postgres : image postgres:15-alpine, healthcheck, réseau back-net, volume db-data
+Terraform GCP (terraform-gcp/)
+gke.tf :
 
-### 3) Part 2 - cluster + application (50-70s)
-"D'abord, Terraform cree le cluster GKE (1 node, conforme au sujet), puis le node pool. Ensuite, les manifests applicatifs sont appliques: vote, result, worker, db, redis, services, PVC, job seed et HPA."
+Crée un cluster GKE avec 1 noeud e2-medium dans europe-west3-a
+deletion_protection = false pour pouvoir détruire avec terraform destroy
+Node pool séparé du cluster (best practice GKE)
+gke-config.tf :
 
-"Je valide ensuite le resultat avec `kubectl get nodes` et `kubectl get pods,svc,pvc,hpa,jobs -o wide` pour prouver que l'etat runtime correspond a l'etat declare."
+Configure le provider Kubernetes avec le token OAuth2 du cluster GKE
+depends_on sur le node pool pour s'assurer que le cluster est prêt
+k8s-manifests.tf :
 
-### 4) Part 3 - Redis externalise (60-90s)
-"La valeur ajoutee Part 3 est de decoupler Redis du cluster: Redis tourne sur une VM GCP dediee, securisee par mot de passe."
+Lit tous les YAML de k8s/ et les applique via kubernetes_manifest
+Injecte le namespace et le mot de passe PostgreSQL dynamiquement
+Si enable_redis_vm = true : exclut redis-deployment.yaml et transforme le service Redis en headless
+redis-vm.tf (optionnel Part 3) :
 
-"Techniquement, Terraform:
-- cree la VM Redis,
-- retire le deployment Redis Kubernetes,
-- transforme le service Redis en service headless,
-- cree un objet Endpoints qui pointe vers l'IP privee de la VM.
+VM e2-micro Debian 12 avec script cloud-init qui installe Redis
+Configure Redis pour écouter sur 0.0.0.0 avec mot de passe
+kubernetes_manifest.redis_endpoints crée un Endpoint manuel pointant vers l'IP interne de la VM
+variables.tf :
 
-Ainsi, les applications continuent d'utiliser le nom logique `redis`, mais le backend reel est externe au cluster."
-
-### 5) Verification de preuve (40-60s)
-"Je montre trois preuves:
-- `terraform output redis_vm_internal_ip` donne l'IP privee de la VM,
-- `kubectl get svc redis` montre `CLUSTER-IP None` (headless),
-- `kubectl get endpoints redis -o wide` montre l'IP de la VM Redis.
-
-Ces trois points prouvent que l'externalisation Redis est effective."
-
-### 6) Conclusion (20-30s)
-"En conclusion, on a une chaine complete: local Terraform valide, GKE provisionne par Terraform, deploiement applicatif Kubernetes, puis extension d'architecture avec Redis externalise. Toute la demo est reproductible et pilotable par IaC."
-
----
-
-## Quoi montrer dans le code pendant que je parle
-
-## A. Creation du cluster GKE
-Fichier: `terraform-gcp/gke.tf`
-A montrer:
-- resource `google_container_cluster`
-- node pool avec 1 node
-- parametres de localisation (zone)
-
-Phrase a dire:
-"Ici, on declare le cluster et son node pool de facon declarative, sans action manuelle sur la console GCP."
-
-## B. Application des manifests Kubernetes
-Fichier: `terraform-gcp/k8s-manifests.tf`
-A montrer:
-- resource `kubernetes_manifest` pour les manifests applicatifs
-- logique de namespace
-- `computed_fields` pour stabiliser le comportement provider
-
-Phrase a dire:
-"On reutilise nos YAML Kubernetes existants, ce qui garde une source de verite unique entre k8s et Terraform."
-
-## C. Part 3 Redis VM
-Fichier: `terraform-gcp/redis-vm.tf`
-A montrer:
-- resource `google_compute_instance.redis_vm`
-- script startup qui installe/configure redis + mot de passe
-
-Phrase a dire:
-"Redis n'est plus un pod; il devient un service infra dedie sur VM."
-
-## D. Routage Kubernetes vers la VM Redis
-Fichier: `terraform-gcp/k8s-manifests.tf`
-A montrer:
-- service Redis headless
-- resource `kubernetes_manifest.redis_endpoints`
-
-Phrase a dire:
-"Le nom DNS interne `redis` reste stable pour l'application, mais l'endpoint pointe maintenant vers la VM externe."
-
-## E. Cote application (compatibilite Part 3)
-Fichiers:
-- `vote/app.py`
-- `worker/Program.cs`
-
-A montrer:
-- lecture de `REDIS_HOST`
-- lecture de `REDIS_PASSWORD`
-
-Phrase a dire:
-"Le code applicatif est parametre par variables d'environnement, donc la migration infra se fait sans casser la logique metier."
-
----
-
-## Sequence de demo conseillee (checklist rapide)
-1. `terraform -chdir=terraform-gcp plan`
-2. `terraform -chdir=terraform-gcp apply -auto-approve -target="google_container_cluster.primary" -target="google_container_node_pool.primary"`
-3. `gcloud container clusters get-credentials projet-nuage-tf --zone europe-west3-a --project lab-gcp-kube`
-4. `terraform -chdir=terraform-gcp apply -auto-approve`
-5. `kubectl get nodes`
-6. `kubectl get pods,svc,pvc,hpa,jobs -o wide`
-7. `terraform -chdir=terraform-gcp output redis_vm_internal_ip`
-8. `kubectl get svc redis`
-9. `kubectl get endpoints redis -o wide`
-
----
-
-## Reponses courtes aux questions possibles
-
-Q: Pourquoi Terraform + YAML Kubernetes ?
-R: "Terraform gere le cycle de vie infra complet, et `kubernetes_manifest` permet de reutiliser nos YAML sans duplication."
-
-Q: Pourquoi un apply cible avant apply complet ?
-R: "Pour eviter les erreurs de client Kubernetes avant que le cluster n'existe et que le kubeconfig soit charge."
-
-Q: Comment prouver la Part 3 ?
-R: "IP Redis VM dans output Terraform + service headless + endpoints Kubernetes vers cette IP."
-
-Q: Si un pod reste Pending ?
-R: "Sur cluster 1-node, c'est une contrainte capacite (CPU/memoire), pas un echec IaC."
-
----
-
-## Closing final (10 secondes)
-"Notre architecture est entierement scriptable, reproductible et verifiable: c'est exactement l'objectif DevOps du projet."
+gcp_project_id, gcp_zone, gke_cluster_name, gke_node_count
+postgres_password (sensitive), redis_password (sensitive)
+enable_redis_vm : toggle pour activer/désactiver la VM Redis
+manifest_files : liste des YAML à appliquer
+Points clés à mentionner
+ClusterIP vs LoadBalancer : Redis et DB sont TOUJOURS ClusterIP (sécurité)
+PVC : sans le subPath: data, PostgreSQL échoue car le répertoire n'est pas vide
+InitContainer : pattern élégant pour injecter des scripts sans créer d'images custom
+ConfigMap : centralise la config, un seul endroit à modifier
+Redis VM (Part 3) : découplage de Redis du cluster, service headless + Endpoints manuels
+terraform destroy supprime tout le cluster et les ressources associées
