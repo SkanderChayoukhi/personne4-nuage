@@ -1,50 +1,48 @@
 # Pitch oral - Personne 4 (Redis + DB + Infra GKE)
 
-## Role
+## Role (ce que je dis en 10 secondes)
 
-Je presente la couche donnees (Redis + PostgreSQL) et toute l'infrastructure GKE/Terraform GCP.
-
-Message central:
-
-- Redis = stockage temporaire des votes
-- PostgreSQL = stockage persistant des resultats
-- Terraform = deploiement reproductible local + GCP
+"Je suis la personne 4. Je couvre la couche donnees Redis/PostgreSQL et l'infrastructure GKE avec Terraform, y compris l'extension Part 3: Redis externalise sur VM."
 
 ---
 
-## Script oral (a lire) + Code a afficher en parallele
+## Ordre d'ouverture des fichiers pendant l'oral
 
-## 0) Ouverture (15s)
-
-Ce que je dis:
-"Je suis la personne 4. Je couvre la couche donnees Redis/PostgreSQL et l'infra GKE avec Terraform. Je vais montrer comment on passe d'un deploiement local a un deploiement cloud reproductible, puis l'extension Part 3 avec Redis sur VM."
-
-Code a afficher:
-
-- `docker-compose.yaml`
-- `terraform-gcp/gke.tf`
+1. `docker-compose.yaml`
+2. `healthchecks/redis.sh` et `healthchecks/postgres.sh`
+3. `k8s/redis-deployment.yaml`, `k8s/redis-service.yaml`
+4. `k8s/db-deployment.yaml`, `k8s/db-pvc.yaml`, `k8s/db-service.yaml`
+5. `k8s/app-configmap.yaml` et `k8s/kustomize/kustomization.yaml`
+6. `terraform/modules/redis/main.tf` et `terraform/modules/postgres/main.tf`
+7. `terraform-gcp/gke.tf` puis `terraform-gcp/gke-config.tf`
+8. `terraform-gcp/k8s-manifests.tf`
+9. `terraform-gcp/redis-vm.tf`
+10. `vote/app.py`, `worker/Program.cs`, `result/server.js`
 
 ---
+
+## Script oral detaille + blocs exacts a montrer
 
 ## 1) Docker data layer (45s)
 
 Ce que je dis:
-"En local, Redis et PostgreSQL sont deploies sans Dockerfile custom: `redis:alpine` et `postgres:15-alpine`. Les deux sont sur le reseau interne. PostgreSQL monte un volume `db-data` pour persister les donnees."
+"En local, Redis et PostgreSQL sont deployes directement via images officielles, sans Dockerfile custom pour ces deux services. Ils restent sur le reseau interne back-net. PostgreSQL persiste les donnees via le volume db-data."
 
-"Les credentials PostgreSQL sont passes par variables d'environnement: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`."
+"Les variables PostgreSQL sont explicites dans compose: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB."
 
-Code a afficher:
-
-- `docker-compose.yaml` (services `redis` et `db`, reseaux, volume `db-data`)
-
-Bloc a montrer:
+Bloc a montrer dans `docker-compose.yaml`:
 
 ```yaml
+redis:
+	image: redis:alpine
+	networks:
+		- back-net
+
 db:
 	image: postgres:15-alpine
 	environment:
 		POSTGRES_USER: postgres
-		POSTGRES_PASSWORD: ...
+		POSTGRES_PASSWORD: postgres
 		POSTGRES_DB: postgres
 	volumes:
 		- db-data:/var/lib/postgresql/data
@@ -52,53 +50,40 @@ db:
 
 ---
 
-## 2) Healthchecks shell (30s)
+## 2) Healthchecks shell (25s)
 
 Ce que je dis:
-"Les checks sont explicites et metier: Redis doit repondre `PONG`, PostgreSQL doit repondre `SELECT 1 = 1`."
+"Les checks sont metier: Redis doit renvoyer PONG, PostgreSQL doit valider SELECT 1."
 
-Code a afficher:
-
-- `healthchecks/redis.sh`
-- `healthchecks/postgres.sh`
-
-Bloc a montrer:
+Blocs a montrer:
 
 ```sh
-# redis.sh
+# healthchecks/redis.sh
 ping="$(redis-cli -h "$host" ping)"
-[ "$ping" = "PONG" ]
+[ "$ping" = 'PONG' ]
 ```
 
 ```sh
-# postgres.sh
-select="$(echo 'SELECT 1' | psql ... )"
-[ "$select" = "1" ]
+# healthchecks/postgres.sh
+select="$(echo 'SELECT 1' | psql --host "$host" --username "$user" --dbname "$db" --quiet --no-align --tuples-only)"
+[ "$select" = '1' ]
 ```
 
 ---
 
-## 3) Kubernetes Redis/DB (1 min)
+## 3) Kubernetes Redis + DB (1 min)
 
 Ce que je dis:
-"Sur Kubernetes, Redis et DB restent internes: services `ClusterIP` uniquement, donc pas d'exposition internet."
+"Sur Kubernetes, Redis et DB ne sont jamais exposes publiquement: les deux services sont en ClusterIP."
 
-"Pour les healthchecks sans image custom, on utilise un pattern propre: initContainer `busybox` qui ecrit le script dans un volume `emptyDir`, puis livenessProbe `exec` dans le conteneur principal."
+"Pour les probes Redis/DB, on injecte les scripts via initContainer busybox dans un volume emptyDir. Donc pas besoin d'images custom Redis/Postgres."
 
-"Pour PostgreSQL, le PVC garantit la persistance, et `subPath: data` evite les problemes de repertoire non vide."
-
-Code a afficher:
-
-- `k8s/redis-deployment.yaml`
-- `k8s/redis-service.yaml`
-- `k8s/db-deployment.yaml`
-- `k8s/db-pvc.yaml`
-- `k8s/db-service.yaml`
+"Pour PostgreSQL, la persistance est assuree par un PVC 1Gi ReadWriteOnce, monte avec subPath: data."
 
 Blocs a montrer:
 
 ```yaml
-# redis-service.yaml
+# k8s/redis-service.yaml
 spec:
 	type: ClusterIP
 	ports:
@@ -106,7 +91,17 @@ spec:
 ```
 
 ```yaml
-# db-deployment.yaml
+# k8s/db-pvc.yaml
+spec:
+	accessModes:
+		- ReadWriteOnce
+	resources:
+		requests:
+			storage: 1Gi
+```
+
+```yaml
+# k8s/db-deployment.yaml
 volumeMounts:
 	- name: db-data
 		mountPath: /var/lib/postgresql/data
@@ -115,135 +110,184 @@ volumeMounts:
 
 ---
 
-## 4) Config centralisee (25s)
+## 4) Config centralisee (20s)
 
 Ce que je dis:
-"La config est centralisee dans une ConfigMap unique, consommee par les services via `envFrom`. On a aussi Kustomize pour generer/mettre a jour proprement la config."
+"La config applicative est centralisee via ConfigMap et consommee avec envFrom. Kustomize permet une generation alternative de cette config."
 
-Code a afficher:
+Blocs a montrer:
 
-- `k8s/app-configmap.yaml`
-- `k8s/kustomize/kustomization.yaml`
+```yaml
+# k8s/app-configmap.yaml
+data:
+	POSTGRES_HOST: db
+	POSTGRES_PORT: "5432"
+	REDIS_HOST: redis
+	REDIS_PORT: "6379"
+```
+
+```yaml
+# k8s/kustomize/kustomization.yaml
+configMapGenerator:
+	- name: app-config
+		behavior: replace
+```
 
 ---
 
-## 5) Terraform GCP (1 min)
+## 5) Terraform local (important: etat actuel du code) (35s)
 
 Ce que je dis:
-"Cote cloud, Terraform cree le cluster GKE et le node pool separe (best practice), avec 1 noeud conforme au sujet."
-
-"Ensuite, Terraform lit les YAML Kubernetes et les applique via `kubernetes_manifest`. On injecte dynamiquement le namespace et les secrets necessaires."
-
-Code a afficher:
-
-- `terraform-gcp/gke.tf`
-- `terraform-gcp/gke-config.tf`
-- `terraform-gcp/k8s-manifests.tf`
-- `terraform-gcp/variables.tf`
+"En Terraform local, Redis/Postgres sont geres dans des modules dedies. Ici, le code actuel n'utilise plus de bind mount healthchecks pour ces modules: les checks sont nativement `redis-cli ping` et `pg_isready`."
 
 Blocs a montrer:
 
 ```hcl
-resource "google_container_cluster" "primary" { ... }
-resource "google_container_node_pool" "primary" { ... }
+# terraform/modules/redis/main.tf
+healthcheck {
+	test = ["CMD", "redis-cli", "ping"]
+}
 ```
 
 ```hcl
-resource "kubernetes_manifest" "app" {
-	for_each = local.manifest_map
-	manifest = each.value
+# terraform/modules/postgres/main.tf
+healthcheck {
+	test = ["CMD-SHELL", "pg_isready -U ${var.postgres_user} -d ${var.postgres_db}"]
 }
 ```
 
 ---
 
-## 6) Part 3 - Redis sur VM (1 min)
+## 6) Terraform GCP (Part 2) (1 min)
 
 Ce que je dis:
-"La Part 3 decouple Redis du cluster. Terraform cree une VM Debian, installe Redis, active mot de passe, et le service Kubernetes devient headless avec un Endpoint manuel vers l'IP interne de la VM."
+"Cote GCP, Terraform cree le cluster GKE et le node pool separe, en zone europe-west3-a, avec deletion_protection a false pour autoriser un destroy propre."
 
-"Donc l'application garde le nom logique `redis`, mais le backend Redis est externe au cluster."
+"Le provider Kubernetes est configure depuis le cluster GKE via token OAuth (`google_client_config`) dans gke-config.tf."
 
-Code a afficher:
-
-- `terraform-gcp/redis-vm.tf`
-- `terraform-gcp/k8s-manifests.tf` (bloc `redis_service` + `redis_endpoints`)
-- `vote/app.py`
-- `worker/Program.cs`
+"Ensuite, on applique tous les YAML via kubernetes_manifest dans k8s-manifests.tf."
 
 Blocs a montrer:
 
 ```hcl
-resource "google_compute_instance" "redis_vm" { ... }
+# terraform-gcp/gke.tf
+resource "google_container_cluster" "primary" {
+	deletion_protection = false
+}
+
+resource "google_container_node_pool" "primary" {
+	node_count = var.gke_node_count
+}
 ```
 
 ```hcl
+# terraform-gcp/gke-config.tf
+data "google_client_config" "default" {}
+
+provider "kubernetes" {
+	token = data.google_client_config.default.access_token
+}
+```
+
+---
+
+## 7) Part 3 Redis VM (1 min)
+
+Ce que je dis:
+"La Part 3 decouple Redis du cluster. Terraform cree une VM Debian, installe redis-server, configure le requirepass, puis Kubernetes bascule le service Redis en headless avec un Endpoints manuel vers l'IP interne de la VM."
+
+"Concretement: quand enable_redis_vm=true, on retire le deployment redis du cluster et on garde le nom logique redis pour l'application."
+
+Blocs a montrer:
+
+```hcl
+# terraform-gcp/redis-vm.tf
+resource "google_compute_instance" "redis_vm" {
+	metadata_startup_script = <<-EOT
+		apt install -y redis-server
+		sed -e '/# requirepass/s/.*/requirepass ${var.redis_password}/' -i /etc/redis/redis.conf
+	EOT
+}
+```
+
+```hcl
+# terraform-gcp/k8s-manifests.tf
 resource "kubernetes_manifest" "redis_endpoints" {
-	manifest = {
-		kind = "Endpoints"
-		...
-	}
+	count = var.enable_redis_vm ? 1 : 0
 }
 ```
+
+---
+
+## 8) Etat reel du code applicatif (point important a assumer) (35s)
+
+Ce que je dis:
+"Pour Redis, vote et worker lisent bien REDIS_HOST/REDIS_PASSWORD via variables d'environnement."
+
+"Pour PostgreSQL, dans l'etat actuel du code, result et worker utilisent encore une connection string hardcodee en postgres/postgres. Donc pour une demo stable, on aligne le mot de passe PostgreSQL sur postgres."
+
+Blocs a montrer:
 
 ```python
 # vote/app.py
-redis_host = os.getenv("REDIS_HOST", "redis")
-redis_password = os.getenv("REDIS_PASSWORD")
+redis_host = os.getenv('REDIS_HOST', 'redis')
+redis_password = os.getenv('REDIS_PASSWORD')
+```
+
+```csharp
+// worker/Program.cs
+var pgsql = OpenDbConnection("Server=db;Username=postgres;Password=postgres;");
+```
+
+```javascript
+// result/server.js
+connectionString: "postgres://postgres:postgres@db/postgres";
 ```
 
 ---
 
-## 7) Demo commandes (ce que je dis pendant execution)
+## 9) Commandes de demo (a executer + phrase orale)
 
-Commande 1:
+1. ```bash
+   gcloud container clusters get-credentials projet-nuage-tf --zone europe-west3-a --project lab-gcp-kube
+   ```
 
-```bash
-gcloud container clusters get-credentials projet-nuage-tf --zone europe-west3-a --project lab-gcp-kube
-```
+````
+Phrase: "Je connecte kubectl au cluster cree par Terraform."
 
-Je dis:
-"Je connecte kubectl au cluster cree par Terraform."
-
-Commande 2:
-
-```bash
+2. ```bash
 kubectl get nodes
 kubectl get pods,svc,pvc,hpa,jobs -o wide
+````
+
+Phrase: "Je valide l'etat runtime global."
+
+3. ```bash
+   terraform -chdir=terraform-gcp output redis_vm_internal_ip
+   kubectl get svc redis
+   kubectl get endpoints redis -o wide
+   ```
+
 ```
-
-Je dis:
-"Je valide l'etat runtime de toutes les ressources."
-
-Commande 3:
-
-```bash
-terraform -chdir=terraform-gcp output redis_vm_internal_ip
-kubectl get svc redis
-kubectl get endpoints redis -o wide
-```
-
-Je dis:
-"Je prouve la Part 3: service headless + endpoint vers IP interne de la VM Redis."
+Phrase: "Je prouve la Part 3 avec l'IP VM + service headless + endpoint manuel."
 
 ---
 
-## Reponses flash aux questions
+## Reponses flash (Q/R)
+Q: Pourquoi Redis/DB en ClusterIP ?
+R: "Pour limiter l'exposition: trafic interne seulement."
 
-Q: Pourquoi ClusterIP pour Redis/DB ?
-R: "Par securite: services internes seulement, jamais exposes publiquement."
+Q: Pourquoi initContainer pour les healthchecks ?
+R: "Pour injecter les scripts sans maintenir des images custom."
 
-Q: Pourquoi initContainer ?
-R: "Pour injecter les scripts de healthcheck sans maintenir des images custom Redis/DB."
-
-Q: Pourquoi apply cible d'abord ?
-R: "Pour creer cluster/nodepool avant d'appliquer les manifests Kubernetes, sinon provider k8s non configure."
+Q: Pourquoi apply cible avant apply complet ?
+R: "Pour creer cluster/nodepool et kubeconfig avant les kubernetes_manifest."
 
 Q: Si un pod est Pending ?
-R: "Sur cluster 1-node, c'est en general une limite de capacite, pas un probleme de declaration IaC."
+R: "Sur cluster 1 node, c'est souvent une contrainte de capacite CPU/memoire."
 
 ---
 
 ## Closing (10s)
-
-"Notre resultat: une architecture data + infra propre, securisee, reproductible et verifiable de bout en bout avec Terraform et Kubernetes."
+"Notre stack data et infra est declarative, reproductible et verifiable de bout en bout avec Terraform et Kubernetes."
+```
